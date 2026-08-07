@@ -10,6 +10,24 @@
 
 Logs tell you *what* happened. Metrics tell you *how often*. Traces tell you *why it was slow* and *where it broke*.
 
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  THE OBSERVABILITY GAP                      │
+│                                                             │
+│   LOGS              METRICS             TRACES              │
+│   ─────             ───────             ──────              │
+│  "what happened"   "how often"      "why & where"          │
+│                                                             │
+│  2026-08-07        req_rate: 120/s   gateway (5ms)         │
+│  ERROR: timeout    error_rate: 2%      └─ orders (95ms)    │
+│  in payment svc    p99: 340ms              ├─ inventory OK  │
+│                                            └─ payments ❌  │
+│                                                             │
+│  ← tells you WHAT   tells you HOW →    tells you WHERE →   │
+│    happened          bad it is          it broke            │
+└─────────────────────────────────────────────────────────────┘
+```
+
 In a monolith, a stack trace is enough. In a microservices system, a request touches 10 services before returning — and any one of them could be the problem. You can't debug that with logs and metrics alone. Distributed tracing gives you the causal chain across service boundaries.
 
 ---
@@ -18,9 +36,21 @@ In a monolith, a stack trace is enough. In a microservices system, a request tou
 
 The book organizes everything around three problems:
 
-1. **Instrumentation** — how to generate trace data from your code
-2. **Data Collection** — how to gather, transmit, and store that data efficiently
-3. **Analysis** — how to turn raw traces into actionable insights
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     DISTRIBUTED TRACING                          │
+│                                                                  │
+│  ┌──────────────────┐    ┌─────────────────┐    ┌────────────┐  │
+│  │  INSTRUMENTATION │───►│ DATA COLLECTION │───►│  ANALYSIS  │  │
+│  │                  │    │                 │    │            │  │
+│  │ · Generate spans │    │ · OTel Collector│    │ · Jaeger   │  │
+│  │ · Propagate ctx  │    │ · Batch & sample│    │ · Svc map  │  │
+│  │ · Tag attributes │    │ · Route backend │    │ · RED      │  │
+│  │ · Record errors  │    │ · Filter/enrich │    │ · Diff     │  │
+│  └──────────────────┘    └─────────────────┘    └────────────┘  │
+│         Ch 1–6                 Ch 7–9               Ch 10–13     │
+└──────────────────────────────────────────────────────────────────┘
+```
 
 Every chapter maps back to one of these three.
 
@@ -28,167 +58,449 @@ Every chapter maps back to one of these three.
 
 ## Core Concepts
 
-### Spans
+### Spans — The Atomic Unit
 
-The atomic unit of tracing. A span represents one named operation with:
-- A name (e.g., `"POST /order"`)
-- Start time and end time (duration)
-- Tags/attributes — key-value metadata (`user.id = u42`, `http.status_code = 500`)
-- Events — timestamped logs attached to the span (`"payment failed"`)
-- Status — OK or Error, with an optional error message
-
-Every operation you care about becomes a span.
-
-### Traces
-
-A trace is a tree of spans that share a **trace ID**. It represents one complete end-to-end request through your system — from the first service that received it to the last service that touched it.
+A span represents one named operation. Everything a trace knows lives inside spans.
 
 ```
-Trace: 7f3a9c...
-└── span: gateway.checkout         (120ms)
-    └── span: orders.process       (115ms)
-        ├── span: inventory.check  ( 80ms)
-        └── span: payments.charge  ( 30ms, ERROR)
+┌─────────────────────────────────────────────────────────────┐
+│  span: "POST /order"                                        │
+├─────────────────────────────────────────────────────────────┤
+│  IDENTITY                                                   │
+│    trace_id:  7f3a9c4b2e1d8a6f3b9c2d1e4f5a6b7c8d          │
+│    span_id:   2a3b4c5d6e7f8a9b                              │
+│    parent_id: 1a2b3c4d5e6f7a8b  (nil if root span)         │
+├─────────────────────────────────────────────────────────────┤
+│  TIMING                                                     │
+│    start:    2026-08-07T10:00:00.000Z                       │
+│    end:      2026-08-07T10:00:00.115Z                       │
+│    duration: 115ms                                          │
+├─────────────────────────────────────────────────────────────┤
+│  ATTRIBUTES (searchable key-value metadata)                 │
+│    http.method        = POST                                │
+│    http.status_code   = 200                                 │
+│    user.id            = u42                                 │
+│    order.id           = ord-991                             │
+│    payment.amount     = 49.99                               │
+├─────────────────────────────────────────────────────────────┤
+│  EVENTS (timestamped logs attached to this span)            │
+│    +5ms   "validating order"                                │
+│    +30ms  "stock confirmed"                                 │
+│    +110ms "payment processed"                               │
+├─────────────────────────────────────────────────────────────┤
+│  STATUS:  OK                                                │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-The tree structure shows you causality. The durations tell you where time went.
+### Traces — The Full Request Journey
+
+A trace is a tree of spans sharing a **trace ID**. It represents one complete end-to-end request.
+
+```
+Trace ID: 7f3a9c4b...
+│
+├─ Trace Tree (how it looks in code / storage)
+│
+│  span: gateway.checkout          [0ms ──────────────── 120ms]
+│    └── span: orders.process      [5ms ─────────────── 115ms]
+│             ├── span: inventory  [8ms ──────── 80ms]
+│             └── span: payments   [8ms ── 30ms] ← ERROR
+│
+└─ Trace Timeline (how it looks in Jaeger UI)
+
+   Time →    0ms      30ms      60ms      90ms     120ms
+             |         |         |         |         |
+   gateway   ██████████████████████████████████████████  120ms
+   orders     █████████████████████████████████████      115ms
+   inventory    ████████████████████████████             72ms
+   payments     ████████                                 22ms ❌
+```
+
+The nesting shows causality. The horizontal bars show where time went. Parallel bars (inventory + payments starting at the same time) show fan-out.
 
 ### Context Propagation
 
-For spans to form a trace, each service must pass the trace context to the next one. In HTTP systems this is the `traceparent` header:
+For spans to form a trace, each service must pass trace context to the next one via the `traceparent` header.
 
 ```
-traceparent: 00-7f3a9c4b...-2a3b...-01
-                 ^trace ID   ^span ID
+traceparent: 00  -  7f3a9c4b2e1d8a6f...  -  2a3b4c5d...  -  01
+             ^^      ^^^^^^^^^^^^^^^^^^      ^^^^^^^^^^^^      ^^
+           version      trace ID (128-bit)   parent span ID   flags
+                         shared by all spans   (caller's span)
 ```
 
-The receiving service extracts the trace ID and parent span ID, creates its own child span, and injects the updated header into any outgoing calls.
+How it flows through a real request:
 
-**This is the hardest part to get right.** If propagation breaks anywhere — a missing header, an async queue that doesn't forward context, a goroutine that doesn't inherit the parent context — the trace splits and you lose the causal link.
+```
+  ┌───────────┐
+  │  Client   │  POST /checkout
+  └───────────┘
+        │  (no traceparent — this is the entry point)
+        ▼
+  ┌───────────┐  creates root span (span_id: AAA)
+  │  Gateway  │  injects → traceparent: 00-7f3a...-AAA-01
+  └───────────┘
+        │  POST /order  +  traceparent: 00-7f3a...-AAA-01
+        ▼
+  ┌───────────┐  extracts parent=AAA, creates child span (span_id: BBB)
+  │  Orders   │  injects → traceparent: 00-7f3a...-BBB-01
+  └───────────┘
+        │
+   ┌────┴─────────────────────────┐
+   │  GET /stock                  │  POST /pay
+   │  traceparent: 00-7f3a...-BBB │  traceparent: 00-7f3a...-BBB
+   ▼                              ▼
+┌───────────┐               ┌───────────┐
+│ Inventory │ span_id: CCC  │ Payments  │ span_id: DDD
+└───────────┘               └───────────┘
+
+Result: one trace, four spans, all linked by trace ID 7f3a...
+```
+
+**This is the hardest part to get right.** If propagation breaks anywhere — a missing header, an async queue that drops context, a goroutine that doesn't inherit the parent — the trace splits and you lose the causal link.
 
 ### Instrumentation Approaches
 
-The book maps out several design axes:
+The book maps out the design space across three axes:
 
-**White box vs. black box**
-- White box: instrument from inside your code using an SDK. Full control, more work.
-- Black box: intercept at the network layer (service mesh, eBPF). Zero code changes, less detail.
+```
+AXIS 1: WHO OWNS THE INSTRUMENTATION CODE
+──────────────────────────────────────────
+White Box                        Black Box
+(you write it)                   (infra does it)
+     │                                │
+  SDK in your                    Service mesh /
+  application                    eBPF intercept
+     │                                │
+  Full business                  Zero code changes
+  context                        Transport only
+     │                                │
+  More work                      Less detail
 
-**Library vs. agent**
-- Library: in-process SDK, spans created directly in your code.
-- Agent: out-of-process sidecar that intercepts traffic and generates spans automatically.
+AXIS 2: WHERE THE INSTRUMENTATION RUNS
+───────────────────────────────────────
+Library (in-process)             Agent (out-of-process)
+     │                                │
+  Same process                    Sidecar / daemon
+  as your app                     next to your app
+     │                                │
+  Lower latency                   Language-agnostic
+  Full Go types                   Restarts independently
 
-**Application vs. system level**
-- Application: your code emits spans about business logic (`"payment processed"`).
-- System: infrastructure emits spans about transport (`"TCP connection established"`).
+AXIS 3: WHAT LEVEL OF DETAIL
+──────────────────────────────
+Application level                System level
+     │                                │
+  "payment processed"            "TCP connection"
+  "stock check failed"           "TLS handshake"
+  Business meaning               Infrastructure noise
 
-Most production setups use a combination. The SDK gives you rich business context; the sidecar handles the infrastructure layer.
+Most production systems use: White Box SDK (application) + Black Box mesh (system)
+```
 
 ### OpenTelemetry
 
-The industry standard for instrumentation. OpenTelemetry (OTel) is the merger of OpenTracing and OpenCensus — it provides:
-- **APIs** — language-specific interfaces for creating spans
-- **SDKs** — implementations of those APIs with configurable exporters
-- **Collector** — a standalone service that receives spans, processes them, and routes to any backend
-- **Semantic conventions** — standard attribute names (`http.method`, `db.statement`) so tooling works across languages
+The industry standard. OTel is the merger of OpenTracing and OpenCensus.
 
-OTel is vendor-neutral. You instrument once and can switch backends (Jaeger, Zipkin, Tempo, commercial tools) without touching your code.
+```
+  Your Code  (Go / Python / Java / Node)
+      │
+      │  uses OTel API (vendor-neutral interfaces)
+      ▼
+  OTel SDK  (implements the API, buffers spans locally)
+      │
+      │  exports via OTLP (OpenTelemetry Protocol)
+      ▼
+  OTel Collector  (receives, processes, routes)
+      │
+      ├──────────────► Jaeger       (open source)
+      ├──────────────► Tempo        (Grafana stack)
+      ├──────────────► Zipkin       (open source)
+      ├──────────────► Datadog      (commercial)
+      └──────────────► Honeycomb    (commercial)
+
+You instrument once. You can swap backends without touching application code.
+```
 
 ---
 
 ## Sampling
 
-You cannot trace every request at scale. At 10,000 requests per second, storing every span is prohibitively expensive. Sampling is how you decide what to keep.
+You cannot trace every request at scale. At 10,000 req/s, storing every span is prohibitively expensive. Sampling decides what to keep.
 
-### Head-based sampling
-Decide at the start of a request whether to trace it. Fast and cheap. The problem: you decide before you know if the request will be interesting. You'll discard slow requests and errors at the same rate as normal ones.
+```
+HEAD-BASED SAMPLING                   TAIL-BASED SAMPLING
+───────────────────                   ──────────────────────────
+Request arrives                       Request arrives
+       │                                     │
+       ▼                                     ▼
+  Flip coin                           Collect all spans
+  (at trace start)                    into a buffer
+       │                                     │
+   YES │  NO                                 ▼
+       │   └──► discard immediately    Wait for trace end
+       ▼         (no spans stored)     (decision_wait: 10s)
+  Collect spans                               │
+  Store trace                                 ▼
+                                       Evaluate policies:
+                                       ┌─────────────────────┐
+                                       │ any span ERROR?      │
+                                       │   YES → KEEP (100%) │
+                                       │   NO  ↓             │
+                                       │ any span > 400ms?   │
+                                       │   YES → KEEP (100%) │
+                                       │   NO  ↓             │
+                                       │ probabilistic        │
+                                       │   10% → KEEP        │
+                                       │   90% → DISCARD     │
+                                       └─────────────────────┘
 
-### Tail-based sampling
-Collect all spans for a trace, then decide whether to keep the trace after it completes. Expensive (you buffer spans in memory) but smart — you can keep 100% of errored and slow traces, and drop most normal ones.
-
-A practical sampling policy:
-- Keep 100% of traces with any error span
-- Keep 100% of traces where any span duration > 400ms
-- Keep 10% of everything else
-
-The OTel Collector supports tail-based sampling natively.
+PROBLEM with head-based:              TRADEOFF with tail-based:
+You don't know if a request           All spans must arrive at
+will be slow or errored               the SAME collector instance
+at the moment you decide.             (no horizontal scaling without
+You discard errors and slow           sticky routing or shared storage)
+traces at the same rate as
+normal ones.
+```
 
 ---
 
 ## Data Collection Pipeline
 
 ```
-Service A ──┐
-Service B ──┤──► OTel Collector ──► Jaeger / Tempo / Zipkin
-Service C ──┘         ^
-                       |
-              (batching, sampling,
-               filtering, routing)
+                        SPAN LIFECYCLE
+                        ──────────────
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  APPLICATION                                                │
+  │                                                             │
+  │  func handleCheckout(ctx context.Context) {                 │
+  │      ctx, span := tracer.Start(ctx, "checkout")            │
+  │      defer span.End()                                       │
+  │      span.SetAttributes(attr.String("user.id", userID))    │
+  │  }                                                          │
+  └───────────────────────┬─────────────────────────────────────┘
+                          │ OTLP/HTTP (port 4318)
+                          │ or OTLP/gRPC (port 4317)
+                          ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  OTEL COLLECTOR CONTRIB                                     │
+  │                                                             │
+  │  receivers:   otlp (accepts spans from services)            │
+  │  processors:  tail_sampling (policy evaluation)             │
+  │               batch (group spans before exporting)          │
+  │               resource (add/modify attributes)              │
+  │  exporters:   otlp (forward to Jaeger)                      │
+  └───────────────────────┬─────────────────────────────────────┘
+                          │ OTLP/gRPC (port 4317)
+                          │ (only kept traces forwarded)
+                          ▼
+  ┌─────────────────────────────────────────────────────────────┐
+  │  JAEGER v2                                                  │
+  │                                                             │
+  │  ┌──────────────┐  ┌────────────┐  ┌─────────────────────┐ │
+  │  │ OTLP Receiver│→ │  Storage   │→ │   Query / UI        │ │
+  │  │  :4317 gRPC  │  │  (badger   │  │  :16686             │ │
+  │  │  :4318 HTTP  │  │   or mem)  │  │  trace search       │ │
+  │  └──────────────┘  └────────────┘  │  service map        │ │
+  │                                     │  latency histogram  │ │
+  │                                     └─────────────────────┘ │
+  └─────────────────────────────────────────────────────────────┘
 ```
 
-Services export spans to a local agent or directly to the OTel Collector via OTLP (OpenTelemetry Protocol). The collector handles:
-- Batching spans before writing to storage
-- Applying sampling rules
-- Routing to multiple backends simultaneously
-- Filtering sensitive attributes before storage
-
-Don't export spans directly from services to your storage backend in production. The collector decouples your services from your observability infrastructure.
+Don't export spans directly from services to your storage backend in production. The collector decouples your services from your observability infrastructure — you can swap Jaeger for Tempo without touching a single service.
 
 ---
 
 ## Analysis Patterns
 
 ### Single-trace debugging
-Find one bad request and follow it through the system. The trace tree shows you exactly which service added latency, which call failed, and what the error was. No log grepping across 10 services.
+
+```
+TRACE: 7f3a9c...   Duration: 340ms   Status: ERROR   Spans: 5
+
+  0ms                    170ms                   340ms
+  │                        │                       │
+  gateway.checkout ─────────────────────────────────  340ms
+    orders.process   ───────────────────────────────  330ms
+      inventory.check  ──────────────                 160ms  ← slow
+      payments.charge              ──────────── ❌    170ms  ← error
+
+Click on payments.charge:
+  Status:  ERROR
+  Message: "card declined: insufficient funds"
+  Tags:    payment.amount=149.99, payment.provider=stripe
+  Events:
+    +5ms   "contacting stripe API"
+    +165ms "received decline response"
+```
+
+Find one bad request. The trace tree tells you which service added latency, which call failed, and what the error was. No log grepping across 10 services.
 
 ### Aggregate analysis — RED metrics
-Derive three metrics from trace data across all requests:
-- **Rate** — requests per second per service
-- **Errors** — error rate per service
-- **Duration** — latency distribution (p50, p95, p99) per service
 
-These surface which service is degraded without you having to look at individual traces.
+```
+Derived from trace data across ALL requests:
 
-### Service dependency maps
-Auto-generated from trace relationships. Every parent-child span relationship becomes an edge in the service graph. No manual documentation needed — the map updates itself as your architecture changes.
+SERVICE         RATE          ERRORS        DURATION (p99)
+──────────────────────────────────────────────────────────
+gateway         120 req/s     2.1%          340ms  ← alert
+orders          118 req/s     2.0%          330ms
+inventory        118 req/s     0.1%          280ms  ← slow
+payments        118 req/s     10.3%         170ms  ← high errors
 
-### Trace comparison
-Compare a slow trace against a normal trace for the same endpoint. The diff shows you exactly which span took longer and by how much. Useful for debugging a regression after a deploy.
+  R = Rate      (requests/sec — is traffic normal?)
+  E = Errors    (error rate   — is something broken?)
+  D = Duration  (latency p99  — is something slow?)
+```
+
+### Service dependency map
+
+Auto-generated from trace parent-child relationships. No manual documentation.
+
+```
+  ┌─────────┐   120/s    ┌────────┐   118/s   ┌───────────┐
+  │ gateway │──────────► │ orders │──────────► │ inventory │
+  └─────────┘            └────────┘            └───────────┘
+                              │
+                              │ 118/s
+                              ▼
+                         ┌──────────┐
+                         │ payments │
+                         └──────────┘
+
+Edge thickness = call volume. Edge color = error rate.
+This updates automatically as your architecture evolves.
+```
+
+### Trace comparison (before/after a deploy)
+
+```
+NORMAL TRACE (p50)              SLOW TRACE (p99)
+────────────────────            ─────────────────────────
+gateway    ████  40ms           gateway    ██████████  340ms
+orders     ███   35ms           orders     █████████   330ms
+inventory  ██    20ms           inventory  ████████    280ms  ← diff
+payments   █     10ms           payments   ██          50ms
+
+Diff: inventory span grew 260ms after the v2.1.0 deploy.
+The inventory service introduced a new DB query without an index.
+```
 
 ---
 
 ## Microservices-Specific Challenges
 
-**Fan-out**
-One request spawns many parallel calls. All child spans must share the parent's trace context, even when the calls happen in separate goroutines or threads.
+### Fan-out
 
-**Async workflows**
-Message queues break the request/response model. You need to inject trace context into the message payload and extract it on the consumer side to link producer and consumer spans into one trace.
+```
+request arrives at orders service
+         │
+         ├──────────────────────────────┐
+         │                              │
+         ▼                              ▼
+  goroutine 1                    goroutine 2
+  GET /stock                     POST /pay
+         │                              │
+         ▼                              ▼
+  inventory span                 payments span
 
-**Service meshes**
-Tools like Istio and Linkerd can auto-instrument at the infrastructure layer — no code changes needed. But they only see transport-level data. You still need application instrumentation for business context.
+CRITICAL: context must be passed INTO each goroutine explicitly.
+Go's context.Context is not inherited automatically across goroutines.
+If you forget, the child spans become orphaned root spans — a broken trace.
+
+  WRONG:  go func() { callInventory() }()
+  RIGHT:  go func(ctx context.Context) { callInventory(ctx) }(ctx)
+```
+
+### Async workflows (message queues)
+
+```
+PRODUCER SERVICE                       CONSUMER SERVICE
+────────────────                       ─────────────────
+span: "publish order"                  span: "process order"
+  │                                      │
+  │  inject trace context                │  extract trace context
+  │  into message payload                │  from message payload
+  ▼                                      ▼
+┌─────────────────────┐           ┌─────────────────────┐
+│ Message: {          │           │ Message: {          │
+│   order_id: "991"   │──────────►│   order_id: "991"   │
+│   traceparent:      │  queue    │   traceparent:      │
+│     "00-7f3a-AAA-01"│           │     "00-7f3a-AAA-01"│
+│ }                   │           │ }                   │
+└─────────────────────┘           └─────────────────────┘
+
+Without injecting context into the payload, the consumer span
+becomes an orphaned root span — you lose the producer→consumer link.
+```
+
+### Service meshes
+
+```
+                     ┌──────────────────────────────────┐
+                     │         YOUR POD                 │
+                     │                                  │
+  inbound traffic ──►│  ┌──────────┐   ┌────────────┐  │
+                     │  │  Envoy   │──►│  Your App  │  │
+                     │  │ sidecar  │   │            │  │
+  outbound traffic ◄─│  │(Istio)   │◄──│            │  │
+                     │  └──────────┘   └────────────┘  │
+                     │   auto-instruments               │
+                     │   HTTP/gRPC spans                │
+                     └──────────────────────────────────┘
+
+Mesh gives you: service map, latency, error rate — zero code changes.
+Mesh can't give you: business context, DB queries, user IDs, order amounts.
+You still need the OTel SDK for application-level spans.
+```
 
 ---
 
 ## Beyond Tracing
 
-The final chapters connect traces to the rest of your observability stack.
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                    FULL OBSERVABILITY STACK                      │
+│                                                                  │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐ │
+│  │    TRACES    │   │     LOGS     │   │       METRICS        │ │
+│  │              │   │              │   │                      │ │
+│  │ trace_id:    │◄──│ trace_id:    │   │  RED alerts fire     │ │
+│  │  7f3a...     │   │  7f3a...     │   │  → jump to traces   │ │
+│  │              │   │ "card        │   │  → find examples    │ │
+│  │ span detail  │──►│  declined"   │   │                      │ │
+│  │ → jump to    │   │              │   │                      │ │
+│  │   log lines  │   │              │   │                      │ │
+│  └──────────────┘   └──────────────┘   └──────────────────────┘ │
+│          │                                                       │
+│          ▼                                                       │
+│  ┌──────────────────────────────────┐                           │
+│  │       CONTINUOUS PROFILING       │                           │
+│  │                                  │                           │
+│  │  slow span → attach CPU profile  │                           │
+│  │  see which function ate 280ms    │                           │
+│  └──────────────────────────────────┘                           │
+└──────────────────────────────────────────────────────────────────┘
 
-**Logs + traces**
-Inject the trace ID and span ID into every log line. Now you can jump from a log entry to the exact trace that produced it, or from a trace to all logs generated during that span. Log correlation closes the gap between structured logs and distributed traces.
+Log correlation: inject trace_id + span_id into every log line.
+Jump from a slow span directly to all logs produced during it.
 
-**Metrics + traces**
-When a RED metric alerts, use traces to find representative examples of the slow or errored requests. Metrics tell you something is wrong; traces tell you why.
+Metrics → traces: when p99 latency alerts, search for traces
+with duration > threshold. Get from "something is wrong" to
+"here is a specific example of the broken request" in seconds.
 
-**Continuous profiling**
-Attach CPU and memory profiles to specific spans. When a span is slow, you can see exactly which functions consumed the time — not just that the span was slow, but *why* it was slow at the code level.
+Profiling: attach CPU/memory profiles to specific spans.
+Know not just that a span was slow — know which line of code caused it.
+```
 
 ---
 
 ## Key Takeaways
 
-- The span tree gives you causality. That's what logs and metrics can't give you.
+- The span tree gives you causality. Logs and metrics can't.
 - Context propagation is the load-bearing wall. If it breaks, nothing else works.
 - OTel is the right default in 2026. Don't build on a vendor-specific SDK.
-- Tail-based sampling is worth the complexity. Head-based sampling discards the traces you actually need.
+- Tail-based sampling is worth the complexity. Head-based discards the traces you actually need.
 - Start with instrumentation, then collection, then analysis. In that order.

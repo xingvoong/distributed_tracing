@@ -40,46 +40,175 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 ## Architecture
 
 ```
-Client (curl / load.sh)
-        |
-        v
-[API Gateway :8080]
-  - Creates root span
-  - Injects traceparent header
-        |
-        v
-[Order Service :8081]
-  - Creates child span
-  - Fans out to both services in parallel goroutines
-  - Propagates context into each goroutine
-        |
-        |----------------------------------|
-        v                                  v
-[Inventory Service :8082]        [Payment Service :8083]
-  - Child span                     - Child span
-  - Random latency 50–500ms        - 10% random failure rate
-  - Returns stock count            - Records error on span
-        |                                  |
-        v                                  v
-        |----------------------------------|
-        v
-[OTel Collector Contrib :4318]   ← otelcol/opentelemetry-collector-releases v0.154.0
-  - Receives spans from all services via OTLP/HTTP
-  - Buffers spans until full trace arrives (decision_wait: 10s)
-  - Applies tail-based sampling:
-      · keep 100% if any span has error
-      · keep 100% if any span duration > 400ms
-      · keep 10% of everything else
-  - Forwards kept traces to Jaeger via OTLP/gRPC
-        |
-        v
-[Jaeger v2 :16686]               ← jaegertracing/jaeger:2.20.0
-  - Accepts OTLP on :4317 (gRPC) natively — no agent tier
-  - Stores traces in-memory (dev) or badger (persistent)
-  - UI: service map, trace search, latency analysis, trace diff
+  ┌──────────────────────────────────────────────────────────────┐
+  │                        CLIENT                                │
+  │                  curl / scripts/load.sh                      │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  POST /checkout
+                              │  (no traceparent — trace starts here)
+                              ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  API GATEWAY  :8080                                          │
+  │                                                              │
+  │  · Creates ROOT SPAN  (span_id: AAA)                         │
+  │  · Tags: user.id, http.method, http.status_code              │
+  │  · Injects traceparent: 00-{trace_id}-AAA-01                 │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  POST /order
+                              │  traceparent: 00-{trace_id}-AAA-01
+                              ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  ORDER SERVICE  :8081                                        │
+  │                                                              │
+  │  · Extracts parent span AAA                                  │
+  │  · Creates CHILD SPAN  (span_id: BBB)                        │
+  │  · Fan-out: spawns TWO goroutines in parallel                │
+  │  · Propagates context into EACH goroutine explicitly         │
+  └─────────────────────┬──────────────────────┬────────────────┘
+                        │                      │
+           GET /stock   │                      │  POST /pay
+    traceparent: BBB    │                      │  traceparent: BBB
+                        ▼                      ▼
+  ┌───────────────────────────┐   ┌───────────────────────────┐
+  │  INVENTORY SERVICE :8082  │   │  PAYMENT SERVICE  :8083   │
+  │                           │   │                           │
+  │  · Child span (CCC)       │   │  · Child span (DDD)       │
+  │  · Random sleep 50–500ms  │   │  · 10% random failure     │
+  │  · Tags: item_id, qty     │   │  · Tags: amount, status   │
+  │  · Event: "stock checked" │   │  · On error: records to   │
+  │  · Returns stock count    │   │    span + returns 500     │
+  └─────────────┬─────────────┘   └─────────────┬─────────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                │  All services export spans via
+                                │  OTLP/HTTP → port 4318
+                                ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  OTEL COLLECTOR CONTRIB  :4318                               │
+  │  image: otel/opentelemetry-collector-contrib:0.154.0         │
+  │                                                              │
+  │  1. Receives spans from all 4 services                       │
+  │  2. Buffers until full trace arrives (decision_wait: 10s)    │
+  │  3. Evaluates sampling policies:                             │
+  │       any span ERROR?     → KEEP  (100%)                     │
+  │       any span > 400ms?   → KEEP  (100%)                     │
+  │       everything else     → KEEP  (10%), DROP (90%)          │
+  │  4. Forwards kept traces to Jaeger via OTLP/gRPC             │
+  └───────────────────────────┬──────────────────────────────────┘
+                              │  OTLP/gRPC → port 4317
+                              ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │  JAEGER v2  :16686                                           │
+  │  image: jaegertracing/jaeger:2.20.0                          │
+  │                                                              │
+  │  · Accepts OTLP natively (no agent tier in v2)               │
+  │  · Stores traces (in-memory for dev, badger for persistent)  │
+  │  · UI: service map, trace search, span detail, trace diff    │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-> **Jaeger v2 note:** v2 dropped the agent sidecar. Services no longer push to a local agent — spans go directly to the OTel Collector, which forwards to Jaeger. Jaeger v2 itself is built on the OTel Collector framework and accepts OTLP on port 4317 (gRPC) and 4318 (HTTP) out of the box.
+> **Jaeger v2 note:** v2 dropped the agent sidecar. Services no longer push to a local agent — spans go directly to the OTel Collector, which forwards to Jaeger. Jaeger v2 accepts OTLP on port 4317 (gRPC) and 4318 (HTTP) natively.
+
+---
+
+## What a Trace Looks Like
+
+After a request completes, this is the span tree you'll see in Jaeger:
+
+```
+Trace ID: 7f3a9c4b...    Duration: 118ms    Spans: 5    Status: ERROR
+
+  Time →   0ms     20ms     40ms     60ms     80ms    100ms    120ms
+           │        │        │        │        │        │        │
+  gateway  ████████████████████████████████████████████████████  118ms
+  orders    ████████████████████████████████████████████████     115ms
+  inventory   ██████████████████████████████████                  80ms
+  payments    ███████████                                 ❌       22ms
+
+Click on payments span:
+  ┌────────────────────────────────────────────────────┐
+  │ span: payments.charge                              │
+  │ status:  ERROR                                     │
+  │ message: "card declined: insufficient funds"       │
+  │                                                    │
+  │ TAGS                                               │
+  │   payment.amount   = 49.99                         │
+  │   payment.provider = stripe                        │
+  │   http.status_code = 500                           │
+  │                                                    │
+  │ EVENTS                                             │
+  │   +2ms  "contacting payment provider"              │
+  │   +20ms "payment failed"                           │
+  └────────────────────────────────────────────────────┘
+```
+
+---
+
+## Context Propagation Flow
+
+How the `traceparent` header threads through every HTTP call:
+
+```
+  Gateway creates root span
+  ┌──────────────────────────────────┐
+  │ span_id: AAA                     │
+  │ outgoing header:                 │
+  │   traceparent: 00-7f3a-AAA-01   │
+  └──────────────┬───────────────────┘
+                 │
+                 ▼
+  Orders extracts header, creates child
+  ┌──────────────────────────────────┐
+  │ parent_id: AAA                   │
+  │ span_id:   BBB                   │
+  │ outgoing headers (to both):      │
+  │   traceparent: 00-7f3a-BBB-01   │
+  └──────┬───────────────────────────┘
+         │                │
+         ▼                ▼
+  Inventory            Payments
+  ┌──────────┐        ┌──────────┐
+  │ parent:  │        │ parent:  │
+  │   BBB    │        │   BBB    │
+  │ span: CCC│        │ span: DDD│
+  └──────────┘        └──────────┘
+
+All four spans share trace_id: 7f3a...
+That's what stitches them into one trace in Jaeger.
+```
+
+---
+
+## Sampling Decision Flow
+
+```
+  Span arrives at OTel Collector
+          │
+          ▼
+  Buffer spans until trace is complete
+  (or decision_wait: 10s elapses)
+          │
+          ▼
+  ┌───────────────────────────────────┐
+  │  Does any span have status ERROR? │
+  └───────────────────────────────────┘
+       YES │            │ NO
+           ▼            ▼
+        KEEP ✓    ┌─────────────────────────────────┐
+                  │ Does any span duration > 400ms? │
+                  └─────────────────────────────────┘
+                       YES │            │ NO
+                           ▼            ▼
+                        KEEP ✓    ┌──────────────────┐
+                                  │ Probabilistic 10%│
+                                  └──────────────────┘
+                                   10% │     │ 90%
+                                       ▼     ▼
+                                    KEEP ✓  DROP ✗
+
+Result: all broken + slow traces preserved. 90% of normal traffic dropped.
+Storage costs drop dramatically without losing signal.
+```
 
 ---
 
@@ -88,26 +217,28 @@ Client (curl / load.sh)
 ```
 distributed_tracing/
 ├── README.md
+├── book-summary.md
 ├── docker-compose.yml
 ├── otel-collector-config.yaml
 ├── shared/
 │   └── tracing/
-│       └── tracing.go          # OTel SDK init — imported by all services
+│       ├── tracing.go          # OTel SDK init — imported by all services
+│       └── tracing_test.go     # Unit tests for tracer setup
 ├── services/
 │   ├── gateway/
-│   │   ├── main.go
-│   │   └── Dockerfile
+│   │   ├── main.go             # Root span, traceparent injection
+│   │   └── Dockerfile          # golang:1.26 build → alpine:3.20 run
 │   ├── orders/
-│   │   ├── main.go
+│   │   ├── main.go             # Fan-out, goroutine context propagation
 │   │   └── Dockerfile
 │   ├── inventory/
-│   │   ├── main.go
+│   │   ├── main.go             # Latency variance, span events
 │   │   └── Dockerfile
 │   └── payments/
-│       ├── main.go
+│       ├── main.go             # Error recording, random failures
 │       └── Dockerfile
 └── scripts/
-    └── load.sh                 # Fires 50 requests to generate trace data
+    └── load.sh                 # Fires 50 requests to populate Jaeger
 ```
 
 ---
@@ -115,6 +246,46 @@ distributed_tracing/
 ## Build Plan
 
 We build and verify one piece at a time. Nothing moves forward until the current step works.
+
+```
+  Phase 1          Phase 2          Phase 3          Phase 4
+  Shared           Payment          Inventory        Orders
+  Tracing Pkg  →   Service      →   Service      →   Service
+  (foundation)     (simplest)       (latency)        (fan-out)
+       │                │                │                │
+   go test         curl 10x         curl 5x         curl w/
+   passes          ~1 failure       latency         both svcs
+                   visible          varies          running
+       │                │                │                │
+       └────────────────┴────────────────┴────────────────┘
+                                 │
+                                 ▼
+                            Phase 5
+                            Gateway
+                            (root span)
+                                 │
+                            curl all 4
+                            svcs running
+                                 │
+                                 ▼
+                            Phase 6
+                            Docker Compose
+                            + OTel Collector
+                            + Jaeger v2
+                                 │
+                            one trace in
+                            Jaeger UI
+                                 │
+                                 ▼
+                            Phase 7
+                            Load Script
+                            50 requests
+                                 │
+                            service map
+                            + checklist ✓
+```
+
+---
 
 ### Phase 1 — Shared Tracing Package
 **File:** `shared/tracing/tracing.go`
@@ -125,9 +296,10 @@ Write the OTel SDK initialization function all services will call. It sets up:
 - W3C Trace Context propagator (the `traceparent` header standard)
 - Returns a `shutdown` function the caller defers for graceful flush
 
-**Verify:** Unit test that the tracer provider initializes without error and returns a valid tracer.
+**Verify:**
 ```bash
 cd shared/tracing && go test ./...
+# Should pass: tracer provider init, tracer creation, shutdown without panic
 ```
 
 ---
@@ -143,10 +315,16 @@ HTTP server on `:8083`. One endpoint: `POST /pay`.
 
 **Verify:**
 ```bash
-go run services/payments/main.go
-curl -X POST http://localhost:8083/pay -d '{"amount": 49.99}'
-# Run 10 times, confirm ~1 failure
-# Confirm spans appear in stdout logs
+go run ./services/payments/main.go &
+
+# Run 10 times — expect ~1 failure
+for i in $(seq 1 10); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -X POST http://localhost:8083/pay \
+    -d '{"amount": 49.99}'
+done
+
+# Expected output: 9x "200", 1x "500" (roughly)
 ```
 
 ---
@@ -163,10 +341,14 @@ HTTP server on `:8082`. One endpoint: `GET /stock`.
 
 **Verify:**
 ```bash
-go run services/inventory/main.go
-curl http://localhost:8082/stock?item_id=abc123
-# Run 5 times, confirm latency varies
-# Check span duration reflects the sleep
+go run ./services/inventory/main.go &
+
+# Run 5 times — response times should vary noticeably
+for i in $(seq 1 5); do
+  time curl -s http://localhost:8082/stock?item_id=abc123
+done
+
+# Expected: each response between 50ms–500ms, durations differ
 ```
 
 ---
@@ -184,13 +366,15 @@ HTTP server on `:8081`. One endpoint: `POST /order`.
 
 **Verify:**
 ```bash
-# Start inventory and payment services first
-go run services/inventory/main.go &
-go run services/payments/main.go &
-go run services/orders/main.go
-curl -X POST http://localhost:8081/order -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
-# Confirm both downstream calls happen
-# Confirm errors from payment surface on order span
+# Services from phases 2 & 3 should still be running
+go run ./services/orders/main.go &
+
+curl -X POST http://localhost:8081/order \
+  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+  -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
+
+# Confirm: response includes both inventory + payment results
+# Confirm: payment errors surface in the order response
 ```
 
 ---
@@ -199,21 +383,21 @@ curl -X POST http://localhost:8081/order -d '{"item_id": "abc123", "amount": 49.
 **File:** `services/gateway/main.go`
 
 HTTP server on `:8080`. One endpoint: `POST /checkout`.
-- Creates the **root span** — this is the trace entry point
+- Creates the **root span** — trace entry point, no parent
 - Injects `traceparent` into outgoing request to Order Service
 - Tags span: `user.id`, `http.method`, `http.status_code`
 - Returns the aggregated response to the client
 
 **Verify:**
 ```bash
-# Start all three downstream services
-go run services/inventory/main.go &
-go run services/payments/main.go &
-go run services/orders/main.go &
-go run services/gateway/main.go
-curl -X POST http://localhost:8080/checkout -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
-# Confirm end-to-end request works
-# Confirm trace context flows through all 4 services
+# All three downstream services should still be running
+go run ./services/gateway/main.go &
+
+curl -X POST http://localhost:8080/checkout \
+  -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
+
+# Confirm: end-to-end request completes
+# Confirm: stdout shows spans from all 4 services with matching trace IDs
 ```
 
 ---
@@ -222,11 +406,9 @@ curl -X POST http://localhost:8080/checkout -d '{"item_id": "abc123", "amount": 
 **Files:** `docker-compose.yml`, `otel-collector-config.yaml`, all `Dockerfile`s
 
 Wire everything together in this order:
-1. `jaegertracing/jaeger:2.20.0` — configure OTLP receiver on 4317, UI on 16686
+1. `jaegertracing/jaeger:2.20.0` — OTLP receiver on 4317, UI on 16686
 2. `otel/opentelemetry-collector-contrib:0.154.0` — tail sampling → forwards to Jaeger gRPC
-3. All 4 services as containers — each uses `golang:1.26-alpine` base
-
-All Dockerfiles use a two-stage build: `golang:1.26` to compile, `alpine:3.20` to run.
+3. All 4 services as containers — each uses `golang:1.26` to compile, `alpine:3.20` to run
 
 Sampling rules in `otel-collector-config.yaml`:
 ```yaml
@@ -248,9 +430,13 @@ processors:
 **Verify:**
 ```bash
 docker compose up --build
-curl -X POST http://localhost:8080/checkout -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
+
+curl -X POST http://localhost:8080/checkout \
+  -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
+
 open http://localhost:16686
-# Confirm trace appears in Jaeger with all 4 services and 5+ spans
+# Search for service: gateway
+# Confirm one trace appears with 5 spans across all 4 services
 ```
 
 ---
@@ -258,11 +444,7 @@ open http://localhost:16686
 ### Phase 7 — Load Script + Full Analysis
 **File:** `scripts/load.sh`
 
-Send 50 requests to generate enough data to see patterns:
-- Service dependency graph in Jaeger
-- Latency histogram (inventory spikes should stand out)
-- Errored traces isolated by status
-- Span attribute search (`user.id = u42`)
+Send 50 requests to generate enough data to see patterns.
 
 **Verify:**
 ```bash
@@ -270,49 +452,94 @@ bash scripts/load.sh
 open http://localhost:16686
 ```
 
-In Jaeger, confirm:
-- [ ] Service map shows all 4 nodes with edges between them
-- [ ] Trace search returns results filtered by service name
-- [ ] At least 4-5 errored traces visible (payment failures)
-- [ ] Latency spread visible on inventory spans (50ms–500ms range)
-- [ ] Clicking a trace shows the full span tree: gateway → order → inventory + payment
-- [ ] Span attributes (`user.id`, `order.id`, `payment.amount`) visible on spans
-- [ ] Span events ("stock check complete", "payment failed") visible in span detail
+Jaeger checklist — confirm all of these before calling it done:
+
+```
+  SERVICE MAP  (/dependencies tab)
+  ─────────────────────────────────────────────────────────
+  [ ] 4 nodes visible: gateway, orders, inventory, payments
+  [ ] Directed edges: gateway→orders, orders→inventory,
+      orders→payments
+  [ ] Edge thickness varies with call volume
+
+  TRACE SEARCH  (/search tab)
+  ─────────────────────────────────────────────────────────
+  [ ] Filter service=gateway returns results
+  [ ] Filter tag=error=true shows only broken traces
+  [ ] Filter min-duration=400ms shows only slow traces
+  [ ] At least 4–5 errored traces visible (payment failures)
+  [ ] Latency spread visible: some traces < 100ms, some > 400ms
+
+  TRACE DETAIL  (click any trace)
+  ─────────────────────────────────────────────────────────
+  [ ] Full span tree: gateway → orders → inventory + payments
+  [ ] Inventory and payments spans appear at the same level
+      (both children of orders — parallel fan-out)
+  [ ] Errored payment span shows red / ERROR status
+  [ ] Span durations on timeline match expected ranges
+      (inventory: 50–500ms, payments: 10–30ms)
+
+  SPAN DETAIL  (click any span in trace view)
+  ─────────────────────────────────────────────────────────
+  [ ] Tags: user.id, order.id, payment.amount visible
+  [ ] Events: "stock check complete", "payment failed" visible
+  [ ] Process: service.name, service.version from resource attrs
+```
 
 ---
 
 ## Jaeger UI Walkthrough
 
-Once traces are flowing, here's what to look for:
+```
+  localhost:16686
+  ┌──────────────────────────────────────────────────────────────┐
+  │  [Search] [System Architecture] [JSON File]                  │
+  └──────────────────────────────────────────────────────────────┘
 
-**Service Map** (`/dependencies` tab)
-- Four nodes: gateway, orders, inventory, payments
-- Directed edges show call direction and call volume
-- This is auto-generated from trace data — no manual config
+  SEARCH TAB
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Service:   [gateway        ▼]  Operation: [all   ▼]         │
+  │  Tags:      [ error=true       ]  Lookback: [1 hour ▼]       │
+  │  Min Duration: [   ] Max Duration: [   ]   Limit: [20]       │
+  │  [Find Traces]                                               │
+  ├──────────────────────────────────────────────────────────────┤
+  │  ● gateway: checkout  5 spans  118ms  2 min ago       ERROR  │
+  │  ● gateway: checkout  5 spans   42ms  2 min ago              │
+  │  ● gateway: checkout  5 spans  340ms  3 min ago       SLOW   │
+  │  ● gateway: checkout  5 spans   67ms  3 min ago              │
+  └──────────────────────────────────────────────────────────────┘
 
-**Trace Search** (`/search` tab)
-- Filter by service: `gateway`
-- Filter by tag: `error=true` to find only broken traces
-- Filter by duration: `>400ms` to find slow traces
-- Each result shows span count, duration, and timestamp
+  TRACE DETAIL  (click a trace)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  Trace 7f3a9c...   118ms   5 Spans   2026-08-07 10:00:00     │
+  ├──────────────────────────────────────────────────────────────┤
+  │  Service       Span Name          0ms          60ms    118ms  │
+  │  ──────────────────────────────────────────────────────────  │
+  │  gateway     ▼ checkout          ████████████████████████    │
+  │  orders      ▼   process          ███████████████████████    │
+  │  inventory       check              ██████████████           │
+  │  payments        charge  ❌           ████████               │
+  └──────────────────────────────────────────────────────────────┘
 
-**Trace Detail** (click any trace)
-- Timeline view: nested spans show the call tree
-- Parallel spans (inventory + payment) appear at the same vertical level
-- Hover a span: see all attributes, events, and error messages
-- Compare two traces: select two from search results to diff them
-
-**Span Detail** (click any span in trace view)
-- Tags section: `user.id`, `payment.amount`, etc.
-- Logs section: span events like "payment failed"
-- Process section: `service.name`, `service.version` from resource attributes
+  SYSTEM ARCHITECTURE TAB
+  ┌──────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │    [gateway] ──────────────────► [orders]                    │
+  │                                     │                        │
+  │                          ┌──────────┴──────────┐            │
+  │                          ▼                     ▼            │
+  │                     [inventory]           [payments]         │
+  │                                                              │
+  │  Node size = call volume. Red tint = error rate.            │
+  └──────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Running the Project
 
 ```bash
-# Start everything (Docker Compose v2 syntax — no hyphen)
+# Start everything (Docker Compose v2 — no hyphen)
 docker compose up --build
 
 # Generate trace data
@@ -338,3 +565,7 @@ docker compose down
 **Tail-based Sampling** — the OTel Collector sees the full trace before deciding whether to keep it. Keeps errors and slow traces, drops most normal ones.
 
 **OTLP** — OpenTelemetry Protocol. The wire format services use to send spans to the collector.
+
+**Root span** — the first span in a trace, created by the entry point service. Has no parent span ID.
+
+**Fan-out** — one parent span spawning multiple parallel child spans. Context must be passed explicitly into each goroutine.
