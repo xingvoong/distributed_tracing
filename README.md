@@ -21,19 +21,28 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 
 ---
 
-## What This Demonstrates
+## Tracing Concepts — Where Each One Lives
 
-| Book Concept | Implementation |
-|---|---|
-| Spans + Traces | Each service creates child spans linked by a shared trace ID |
-| Context Propagation | `traceparent` HTTP header flows through every service call |
-| Fan-out | Order Service calls Inventory + Payment in parallel goroutines |
-| Span attributes | `user.id`, `order.id`, `payment.amount` tagged on spans |
-| Span events | In-span logs ("stock confirmed", "payment failed") |
-| Error recording | Payment failures marked on the span — visible in Jaeger |
-| Sampling | OTel Collector: 100% of errored/slow traces, 10% of normal |
-| Collection pipeline | OTel Collector → Jaeger |
-| Analysis | Service map, latency histograms, trace comparison in Jaeger UI |
+| Book Concept | Phase | Code | README |
+|---|---|---|---|
+| Tracer provider | 1 | `shared/tracing/tracing.go:30` | Phase 1 — `tracing.Init()` |
+| Resource attributes | 1 | `shared/tracing/tracing.go:22` | Phase 1 — `tracing.Init()` |
+| OTLP exporter | 1 | `shared/tracing/tracing.go:37` | Architecture diagram → `:4318` |
+| W3C propagator (`traceparent`) | 1 | `shared/tracing/tracing.go:47` | Context Propagation Flow |
+| Shutdown / span flush | 1 | `shared/tracing/tracing.go:51` | Phase 1 — `defer shutdown()` |
+| Child spans | 2 | `services/payments/main.go:31` | Phase 2 flow diagram |
+| Span attributes | 2 | `services/payments/main.go:37` | Jaeger UI → Span Detail → Tags |
+| Span events | 2 | `services/payments/main.go:43,53` | What a Trace Looks Like → EVENTS |
+| Error recording | 2 | `services/payments/main.go:48` | Sampling Decision Flow → ERROR policy |
+| Context extraction | 2 | `services/payments/main.go:29` | Context Propagation Flow |
+| Latency variance | 3 | `services/inventory/main.go` | Sampling Decision Flow → slow traces |
+| Fan-out + goroutines | 4 | `services/orders/main.go` | Architecture diagram |
+| Root span | 5 | `services/gateway/main.go` | Context Propagation Flow |
+| Collection pipeline | 6 | `otel-collector-config.yaml` | Architecture diagram → OTel Collector |
+| Tail-based sampling | 6 | `otel-collector-config.yaml` | Sampling Decision Flow |
+| Service map | 7 | Jaeger UI | Jaeger UI Walkthrough |
+| Aggregate analysis (RED) | 7 | Jaeger UI | Jaeger UI Walkthrough |
+| Trace comparison | 7 | Jaeger UI | Jaeger UI Walkthrough |
 
 ---
 
