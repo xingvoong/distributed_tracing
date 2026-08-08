@@ -507,22 +507,46 @@ go func() { callInventory(ctx, itemID) }()
 go func(ctx context.Context) { callInventory(ctx, itemID) }(ctx)
 ```
 
-**Verified — 15 requests, all 3 services running:**
+**Verified — test_orders.sh (20 requests) + stress_orders.sh (10 × 50 = 500 requests):**
 ```bash
 go run ./services/payments/main.go &
 go run ./services/inventory/main.go &
 go run ./services/orders/main.go &
 
-curl -s -X POST http://localhost:8081/order \
-  -H 'Content-Type: application/json' \
-  -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
+# terminal 2
+bash scripts/test_orders.sh
 
-Request 1:  order=confirmed  payment=approved
-Request 4:  order=failed     payment=declined  ← payment error surfaces on order span
-Request 7:  order=failed     payment=declined  ← payment error surfaces on order span
+Request 1:  421ms  order=confirmed  payment=approved  quantity=1
+Request 17: 423ms  order=failed     payment=declined  quantity=89
+Request 20: 325ms  order=failed     payment=declined  quantity=2
+...
+Confirmed: 18 (90%)   Failed: 2 (10%)
 
-13 confirmed, 2 failed (~13% — within expected range for 10% failure rate)
+# stress test
+bash scripts/stress_orders.sh
+
+Run 1:  confirmed=44  failed=6   failure_rate=12%  avg_latency=331ms
+Run 2:  confirmed=43  failed=7   failure_rate=14%  avg_latency=372ms
+Run 3:  confirmed=48  failed=2   failure_rate=4%   avg_latency=352ms
+Run 4:  confirmed=47  failed=3   failure_rate=6%   avg_latency=375ms
+Run 5:  confirmed=45  failed=5   failure_rate=10%  avg_latency=368ms
+Run 6:  confirmed=48  failed=2   failure_rate=4%   avg_latency=292ms
+Run 7:  confirmed=41  failed=9   failure_rate=18%  avg_latency=333ms
+Run 8:  confirmed=47  failed=3   failure_rate=6%   avg_latency=331ms
+Run 9:  confirmed=46  failed=4   failure_rate=8%   avg_latency=362ms
+Run 10: confirmed=40  failed=10  failure_rate=20%  avg_latency=347ms
+
+────────────────────────────────────────────────────────
+Total requests:  500
+Total confirmed: 449  (89%)
+Total failed:     51  (10%)
+Latency min:     116ms
+Latency max:     670ms
+Latency avg:     346ms
 ```
+
+Per-run variance 4%–20% — expected at 50 requests per run.
+Across 500 total converges to 10%. Latency driven by inventory service (50–500ms sleep).
 
 ---
 
