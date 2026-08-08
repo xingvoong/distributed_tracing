@@ -35,7 +35,11 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 | Span events | 2 | `services/payments/main.go:48,60` | What a Trace Looks Like → EVENTS |
 | Error recording | 2 | `services/payments/main.go:47` | Sampling Decision Flow → ERROR policy |
 | Context extraction | 2 | `services/payments/main.go:29` | Context Propagation Flow |
-| Latency variance | 3 | `services/inventory/main.go` | Sampling Decision Flow → slow traces |
+| Child spans | 3 | `services/inventory/main.go:25` | Phase 3 flow diagram |
+| Span attributes | 3 | `services/inventory/main.go:39` | Jaeger UI → Span Detail → Tags |
+| Span events | 3 | `services/inventory/main.go:44` | What a Trace Looks Like → EVENTS |
+| Context extraction | 3 | `services/inventory/main.go:24` | Context Propagation Flow |
+| Latency variance | 3 | `services/inventory/main.go:34` | Sampling Decision Flow → slow traces |
 | Fan-out + goroutines | 4 | `services/orders/main.go` | Architecture diagram |
 | Root span | 5 | `services/gateway/main.go` | Context Propagation Flow |
 | Collection pipeline | 6 | `otel-collector-config.yaml` | Architecture diagram → OTel Collector |
