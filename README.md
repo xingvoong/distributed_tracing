@@ -238,7 +238,8 @@ distributed_tracing/
 │       ├── main.go             # Error recording, random failures
 │       └── Dockerfile
 └── scripts/
-    └── load.sh                 # Fires 50 requests to populate Jaeger
+    ├── test_payments.sh        # 20 requests to :8083, prints approved/declined
+    └── load.sh                 # Fires 50 requests to populate Jaeger (Phase 7)
 ```
 
 ---
@@ -287,45 +288,80 @@ We build and verify one piece at a time. Nothing moves forward until the current
 
 ---
 
-### Phase 1 — Shared Tracing Package
-**File:** `shared/tracing/tracing.go`
+### Phase 1 — Shared Tracing Package ✅
+**Files:** `shared/tracing/tracing.go`, `shared/tracing/tracing_test.go`
 
-Write the OTel SDK initialization function all services will call. It sets up:
-- A tracer provider with OTLP/HTTP exporter (`go.opentelemetry.io/otel/exporters/otlp/otlptracehttp v1.38.0`)
-- Resource attributes (`service.name`, `service.version`) using `go.opentelemetry.io/otel/sdk/resource`
-- W3C Trace Context propagator (the `traceparent` header standard)
-- Returns a `shutdown` function the caller defers for graceful flush
+One exported function — `tracing.Init(serviceName string) (func(), error)` — that every service calls at startup.
 
-**Verify:**
+```
+tracing.Init("payments")
+       │
+       ├── resource.New()             stamps service.name + service.version on every span
+       ├── otlptracehttp.New()        OTLP/HTTP exporter → OTEL_EXPORTER_OTLP_ENDPOINT (:4318)
+       ├── NewTracerProvider()        batches spans, feeds exporter
+       ├── otel.SetTracerProvider()   registers globally — any code can call otel.Tracer()
+       ├── otel.SetTextMapPropagator() registers W3C TraceContext — reads/writes traceparent
+       └── returns shutdown()         caller defers this — flushes buffered spans on exit
+```
+
+> **Note:** correct exporter import path is
+> `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp`
+> (not `otlptracehttp` directly — extra `otlptrace` segment in the path)
+
+**Tests — all passing:**
 ```bash
-cd shared/tracing && go test ./...
-# Should pass: tracer provider init, tracer creation, shutdown without panic
+go test ./shared/tracing/... -v
+
+PASS: TestInit_ReturnsShutdown          # Init returns no error, non-nil shutdown
+PASS: TestInit_RegistersTracerProvider  # global provider is *sdktrace.TracerProvider
+PASS: TestInit_RegistersPropagator      # propagator fields include "traceparent"
+PASS: TestInit_TracerCreation           # otel.Tracer() returns a usable tracer
+PASS: TestShutdown_DoesNotPanic         # shutdown flushes cleanly without panic
+ok  github.com/xingvoong/distributed_tracing/shared/tracing  2.689s
 ```
 
 ---
 
-### Phase 2 — Payment Service (simplest)
+### Phase 2 — Payment Service ✅
 **File:** `services/payments/main.go`
 
 HTTP server on `:8083`. One endpoint: `POST /pay`.
-- Creates a child span from incoming context
-- Tags span: `payment.amount`, `payment.status`
-- 10% of requests: return 500 + record error on span
-- 90% of requests: return 200 + record success event on span
 
-**Verify:**
-```bash
-go run ./services/payments/main.go &
-
-# Run 10 times — expect ~1 failure
-for i in $(seq 1 10); do
-  curl -s -o /dev/null -w "%{http_code}\n" \
-    -X POST http://localhost:8083/pay \
-    -d '{"amount": 49.99}'
-done
-
-# Expected output: 9x "200", 1x "500" (roughly)
 ```
+POST /pay
+     │
+     ├── extract trace context from incoming request (traceparent header)
+     ├── tracer.Start(ctx, "payments.charge")   → child span
+     ├── span.SetAttributes(payment.amount, payment.status)
+     │
+     ├── rand.Intn(10) == 0   (10% chance)
+     │        │
+     │    YES ├── span.SetStatus(ERROR, "card declined: insufficient funds")
+     │        ├── span.AddEvent("payment failed")
+     │        └── return 500 JSON
+     │
+     └── NO  ├── span.AddEvent("payment processed")
+             └── return 200 JSON
+```
+
+**Verified — 30 requests, 2 declined (~10%):**
+```bash
+# terminal 1
+go run ./services/payments/main.go
+
+# terminal 2
+bash scripts/test_payments.sh
+
+Request 1:  approved
+Request 4:  declined   ← ERROR span + "payment failed" event recorded
+Request 18: declined   ← ERROR span + "payment failed" event recorded
+...
+```
+
+> Spans are created on every request but exported nowhere yet — no OTel
+> Collector is running. They will appear in Jaeger once Phase 6 is complete.
+> The `traceparent` header is extracted but incoming requests have no parent
+> yet — spans are root spans until Phase 4 wires Orders → Payments.
 
 ---
 
