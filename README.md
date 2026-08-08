@@ -25,15 +25,15 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 
 | Book Concept | Phase | Code | README |
 |---|---|---|---|
-| Tracer provider | 1 | `shared/tracing/tracing.go:30` | Phase 1 — `tracing.Init()` |
-| Resource attributes | 1 | `shared/tracing/tracing.go:22` | Phase 1 — `tracing.Init()` |
-| OTLP exporter | 1 | `shared/tracing/tracing.go:37` | Architecture diagram → `:4318` |
-| W3C propagator (`traceparent`) | 1 | `shared/tracing/tracing.go:47` | Context Propagation Flow |
-| Shutdown / span flush | 1 | `shared/tracing/tracing.go:51` | Phase 1 — `defer shutdown()` |
-| Child spans | 2 | `services/payments/main.go:31` | Phase 2 flow diagram |
-| Span attributes | 2 | `services/payments/main.go:37` | Jaeger UI → Span Detail → Tags |
-| Span events | 2 | `services/payments/main.go:43,53` | What a Trace Looks Like → EVENTS |
-| Error recording | 2 | `services/payments/main.go:48` | Sampling Decision Flow → ERROR policy |
+| Tracer provider | 1 | `shared/tracing/tracing.go:44` | Phase 1 — `tracing.Init()` |
+| Resource attributes | 1 | `shared/tracing/tracing.go:25` | Phase 1 — `tracing.Init()` |
+| OTLP exporter | 1 | `shared/tracing/tracing.go:38` | Architecture diagram → `:4318` |
+| W3C propagator (`traceparent`) | 1 | `shared/tracing/tracing.go:54` | Context Propagation Flow |
+| Shutdown / span flush | 1 | `shared/tracing/tracing.go:56` | Phase 1 — `defer shutdown()` |
+| Child spans | 2 | `services/payments/main.go:30` | Phase 2 flow diagram |
+| Span attributes | 2 | `services/payments/main.go:39` | Jaeger UI → Span Detail → Tags |
+| Span events | 2 | `services/payments/main.go:48,60` | What a Trace Looks Like → EVENTS |
+| Error recording | 2 | `services/payments/main.go:47` | Sampling Decision Flow → ERROR policy |
 | Context extraction | 2 | `services/payments/main.go:29` | Context Propagation Flow |
 | Latency variance | 3 | `services/inventory/main.go` | Sampling Decision Flow → slow traces |
 | Fan-out + goroutines | 4 | `services/orders/main.go` | Architecture diagram |
