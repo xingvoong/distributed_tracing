@@ -43,7 +43,8 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 | Fan-out + goroutines | 4 | `services/orders/main.go:133` | Architecture diagram |
 | Context injection (outgoing) | 4 | `services/orders/main.go:51` | Context Propagation Flow |
 | Error propagation across services | 4 | `services/orders/main.go:155` | Phase 4 flow diagram |
-| Root span | 5 | `services/gateway/main.go` | Context Propagation Flow |
+| Root span | 5 | `services/gateway/main.go:29` | Phase 5 — root span diagram |
+| Trace ID generation | 5 | `services/gateway/main.go:29` | Phase 5 — trace ID flow diagram |
 | Collection pipeline | 6 | `otel-collector-config.yaml` | Architecture diagram → OTel Collector |
 | Tail-based sampling | 6 | `otel-collector-config.yaml` | Sampling Decision Flow |
 | Service map | 7 | Jaeger UI | Jaeger UI Walkthrough |
@@ -574,25 +575,101 @@ Across 500 total converges to 10%. Latency driven by inventory service (50–500
 
 ---
 
-### Phase 5 — API Gateway (root span)
+### Phase 5 — API Gateway ✅
 **File:** `services/gateway/main.go`
 
 HTTP server on `:8080`. One endpoint: `POST /checkout`.
-- Creates the **root span** — trace entry point, no parent
-- Injects `traceparent` into outgoing request to Order Service
-- Tags span: `user.id`, `http.method`, `http.status_code`
-- Returns the aggregated response to the client
 
-**Verify:**
+```
+POST /checkout
+     │
+     ├── NO traceparent on incoming request
+     ├── tracer.Start(ctx, "gateway.checkout")  → ROOT span (no parent)
+     │     └── this generates the trace ID shared by all downstream spans
+     │
+     ├── tag: user.id, http.method, order.item_id, order.amount
+     │
+     ├── build outgoing request to orders :8081
+     ├── Inject(ctx, headers)  → writes traceparent header
+     │     └── starts the propagation chain:
+     │           gateway → orders → inventory
+     │                    → orders → payments
+     │
+     ├── forward response back to client
+     ├── tag: http.status_code
+     └── if orders failed → span ERROR
+```
+
+**New concept — Root span:**
+
+Every other service received a `traceparent` and created a child span.
+Gateway creates a span with no parent — the trace starts here.
+
+```
+Phases 2, 3, 4                        Phase 5
+──────────────────────────────────     ──────────────────────────────────
+incoming request                       incoming request
+  traceparent: 00-7f3a-AAA-01    →       (no traceparent header)
+       │                                         │
+       ▼                                         ▼
+  child span                              ROOT span
+  parent_id: AAA                          parent_id: nil
+  trace_id:  7f3a... (inherited)          trace_id:  NEW (generated here)
+```
+
+**How the trace ID flows through the full system:**
+
+```
+  client
+    │  POST /checkout (no traceparent)
+    ▼
+  gateway  generates trace_id: 7f3a9c...
+    │  POST /order
+    │  traceparent: 00-7f3a9c...-AAA-01    ← trace_id injected here
+    ▼
+  orders   creates span BBB, inherits 7f3a9c...
+    │
+    ├── GET /stock                          ├── POST /pay
+    │   traceparent: 00-7f3a9c...-BBB-01   │   traceparent: 00-7f3a9c...-BBB-01
+    ▼                                      ▼
+  inventory  span CCC, trace: 7f3a9c...  payments  span DDD, trace: 7f3a9c...
+
+  All 4 spans share trace_id: 7f3a9c...
+  That single ID is what Jaeger uses to stitch them into one trace.
+```
+
+**Why latency is driven by inventory, not the sum of all services:**
+
+```
+  0ms                              450ms
+  │                                  │
+  gateway  ██████████████████████████████████  ~460ms total
+  orders    █████████████████████████████████
+  inventory   ████████████████████████████      ~420ms  ← slowest
+  payments    ████                               ~20ms  ← parallel, not sequential
+
+  total = max(inventory, payments) = 420ms
+  NOT   = inventory + payments     = 440ms
+
+  Orders uses sync.WaitGroup — both goroutines fire simultaneously.
+  wg.Wait() unblocks when the LAST one finishes, not after both sequentially.
+```
+
+**Verified — 35 requests across all 4 services:**
 ```bash
-# All three downstream services should still be running
+go run ./services/payments/main.go &
+go run ./services/inventory/main.go &
+go run ./services/orders/main.go &
 go run ./services/gateway/main.go &
 
-curl -X POST http://localhost:8080/checkout \
+curl -s -X POST http://localhost:8080/checkout \
+  -H 'Content-Type: application/json' \
   -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
 
-# Confirm: end-to-end request completes
-# Confirm: stdout shows spans from all 4 services with matching trace IDs
+Request 4:  order=failed  payment=declined  ← error flows gateway → orders → payments → back
+Request 14: order=failed  payment=declined
+
+33 confirmed, 2 failed — latency 153ms–569ms (inventory sleep, not sum of all services)
 ```
 
 ---
