@@ -40,7 +40,9 @@ Jaeger v2 is itself built on the OTel Collector framework and accepts OTLP nativ
 | Span events | 3 | `services/inventory/main.go:44` | What a Trace Looks Like → EVENTS |
 | Context extraction | 3 | `services/inventory/main.go:24` | Context Propagation Flow |
 | Latency variance | 3 | `services/inventory/main.go:34` | Sampling Decision Flow → slow traces |
-| Fan-out + goroutines | 4 | `services/orders/main.go` | Architecture diagram |
+| Fan-out + goroutines | 4 | `services/orders/main.go:133` | Architecture diagram |
+| Context injection (outgoing) | 4 | `services/orders/main.go:51` | Context Propagation Flow |
+| Error propagation across services | 4 | `services/orders/main.go:155` | Phase 4 flow diagram |
 | Root span | 5 | `services/gateway/main.go` | Context Propagation Flow |
 | Collection pipeline | 6 | `otel-collector-config.yaml` | Architecture diagram → OTel Collector |
 | Tail-based sampling | 6 | `otel-collector-config.yaml` | Sampling Decision Flow |
@@ -452,28 +454,74 @@ Requests 2, 5, 6, 7, 8, 9, 10 cross the 400ms threshold — those will be kept
 
 ---
 
-### Phase 4 — Order Service (fan-out)
+### Phase 4 — Order Service ✅
 **File:** `services/orders/main.go`
 
 HTTP server on `:8081`. One endpoint: `POST /order`.
-- Extracts trace context from incoming `traceparent` header
-- Creates a child span
-- Calls Inventory and Payment **in parallel** using goroutines
-- Propagates context correctly into each goroutine
-- Waits for both, aggregates result
-- Records error if either downstream failed
 
-**Verify:**
+```
+POST /order
+     │
+     ├── extract trace context (traceparent header)
+     ├── tracer.Start(ctx, "orders.process")  → child span
+     ├── tag: order.item_id, order.user_id, order.amount
+     │
+     ├── sync.WaitGroup — fan-out to 2 goroutines
+     │     │
+     │     ├── goroutine 1: callInventory(ctx, item_id)   ← ctx passed as arg, not closure
+     │     │     ├── child span "orders.call_inventory"
+     │     │     ├── injectContext() → writes traceparent header   ← NEW in Phase 4
+     │     │     └── GET /stock :8082
+     │     │
+     │     └── goroutine 2: callPayment(ctx, amount)      ← ctx passed as arg, not closure
+     │           ├── child span "orders.call_payment"
+     │           ├── injectContext() → writes traceparent header   ← NEW in Phase 4
+     │           └── POST /pay :8083
+     │
+     ├── wg.Wait() — block until both return
+     ├── stockErr → span ERROR + return 500
+     ├── payErr   → span ERROR + return 500
+     └── return 200 confirmed
+```
+
+**New concepts introduced:**
+
+*Context injection (outgoing):* Phase 2 and 3 only extracted context from incoming
+requests. Phase 4 is the first service that writes `traceparent` onto outgoing
+requests — this is what links Inventory and Payment spans back to the Orders span.
+
+```go
+// services/orders/main.go:50
+func injectContext(ctx context.Context, req *http.Request) {
+    otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
+}
+```
+
+*Fan-out:* context must be passed as a goroutine argument, not captured by closure.
+
+```go
+// WRONG — ctx captured by closure, may be stale
+go func() { callInventory(ctx, itemID) }()
+
+// RIGHT — ctx passed explicitly (services/orders/main.go:135)
+go func(ctx context.Context) { callInventory(ctx, itemID) }(ctx)
+```
+
+**Verified — 15 requests, all 3 services running:**
 ```bash
-# Services from phases 2 & 3 should still be running
+go run ./services/payments/main.go &
+go run ./services/inventory/main.go &
 go run ./services/orders/main.go &
 
-curl -X POST http://localhost:8081/order \
-  -H 'traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' \
+curl -s -X POST http://localhost:8081/order \
+  -H 'Content-Type: application/json' \
   -d '{"item_id": "abc123", "amount": 49.99, "user_id": "u42"}'
 
-# Confirm: response includes both inventory + payment results
-# Confirm: payment errors surface in the order response
+Request 1:  order=confirmed  payment=approved
+Request 4:  order=failed     payment=declined  ← payment error surfaces on order span
+Request 7:  order=failed     payment=declined  ← payment error surfaces on order span
+
+13 confirmed, 2 failed (~13% — within expected range for 10% failure rate)
 ```
 
 ---
