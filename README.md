@@ -251,7 +251,9 @@ distributed_tracing/
 │       ├── main.go             # Error recording, random failures
 │       └── Dockerfile
 └── scripts/
-    ├── test_payments.sh        # 20 requests to :8083, prints approved/declined
+    ├── test_payments.sh        # 100 requests to :8083, prints approved/declined + summary
+    ├── stress_payments.sh      # 10 × 100 requests, per-run failure rate + aggregate
+    ├── test_inventory.sh       # 10 requests to :8082, prints latency + min/max/avg
     └── load.sh                 # Fires 50 requests to populate Jaeger (Phase 7)
 ```
 
@@ -397,27 +399,56 @@ Across 1000 total it converges to 8.7%, confirming `rand.Intn(10) == 0` is corre
 
 ---
 
-### Phase 3 — Inventory Service
+### Phase 3 — Inventory Service ✅
 **File:** `services/inventory/main.go`
 
 HTTP server on `:8082`. One endpoint: `GET /stock`.
-- Creates a child span from incoming context
-- Tags span: `inventory.item_id`, `inventory.quantity`
-- Random sleep 50–500ms to simulate latency variance
-- Adds span event: "stock check complete"
-- Returns stock count as JSON
 
-**Verify:**
-```bash
-go run ./services/inventory/main.go &
-
-# Run 5 times — response times should vary noticeably
-for i in $(seq 1 5); do
-  time curl -s http://localhost:8082/stock?item_id=abc123
-done
-
-# Expected: each response between 50ms–500ms, durations differ
 ```
+GET /stock?item_id=abc123
+     │
+     ├── extract trace context (traceparent header)
+     ├── tracer.Start(ctx, "inventory.check")  → child span
+     ├── sleep 50–500ms  ← rand.Intn(451) + 50  (simulates DB query)
+     ├── span.SetAttributes:
+     │     inventory.item_id  = "abc123"
+     │     inventory.quantity = 42
+     │     inventory.delay_ms = 317          ← exact delay visible in Jaeger
+     ├── span.AddEvent("stock check complete")
+     └── return { item_id, quantity } JSON
+```
+
+**Verified — 10 requests:**
+```bash
+# terminal 1
+go run ./services/inventory/main.go
+
+# terminal 2
+bash scripts/test_inventory.sh
+
+Request 1:  175ms  quantity=19
+Request 2:  454ms  quantity=51
+Request 3:  258ms  quantity=74
+Request 4:  230ms  quantity=20
+Request 5:  493ms  quantity=40
+Request 6:  400ms  quantity=22
+Request 7:  468ms  quantity=89
+Request 8:  550ms  quantity=29
+Request 9:  393ms  quantity=2
+Request 10: 449ms  quantity=46
+
+────────────────────────
+Min:  175ms
+Max:  550ms
+Avg:  387ms
+Expected range: 50–500ms
+```
+
+Requests 2, 5, 6, 7, 8, 9, 10 cross the 400ms threshold — those will be kept
+100% by the tail sampling policy in Phase 6.
+
+> Spans are created on every request but exported nowhere yet — no OTel
+> Collector is running. They will appear in Jaeger once Phase 6 is complete.
 
 ---
 
