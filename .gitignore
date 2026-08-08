@@ -1,0 +1,9 @@
+# compiled binaries
+payments
+inventory
+orders
+gateway
+
+# Go build cache
+*.test
+*.out
