@@ -344,18 +344,19 @@ POST /pay
              └── return 200 JSON
 ```
 
-**Verified — 30 requests, 2 declined (~10%):**
+**Verified — 10 + 20 requests (30 total), 2 declined (~10%):**
 ```bash
 # terminal 1
 go run ./services/payments/main.go
 
-# terminal 2
-bash scripts/test_payments.sh
+# terminal 2 — first run (10 requests, all approved)
+bash scripts/test_payments.sh   # ran 10, got 0 failures (within normal variance)
 
-Request 1:  approved
+# second run (20 requests, 2 declined)
+bash scripts/test_payments.sh   # ran 20, got 2 failures
+
 Request 4:  declined   ← ERROR span + "payment failed" event recorded
 Request 18: declined   ← ERROR span + "payment failed" event recorded
-...
 ```
 
 > Spans are created on every request but exported nowhere yet — no OTel
