@@ -256,6 +256,7 @@ distributed_tracing/
     ├── test_payments.sh        # 100 requests to :8083, prints approved/declined + summary
     ├── stress_payments.sh      # 10 × 100 requests, per-run failure rate + aggregate
     ├── test_inventory.sh       # 10 requests to :8082, prints latency + min/max/avg
+    ├── stress_inventory.sh     # 10 × 20 requests, per-run + aggregate latency stats
     └── load.sh                 # Fires 50 requests to populate Jaeger (Phase 7)
 ```
 
@@ -448,6 +449,29 @@ Expected range: 50–500ms
 
 Requests 2, 5, 6, 7, 8, 9, 10 cross the 400ms threshold — those will be kept
 100% by the tail sampling policy in Phase 6.
+
+**Stress test — stress_inventory.sh (10 × 20 = 200 requests):**
+```bash
+bash scripts/stress_inventory.sh
+
+Run 1:  min=140ms  max=556ms  avg=330ms
+Run 2:  min=141ms  max=566ms  avg=328ms
+Run 3:  min=125ms  max=494ms  avg=305ms
+Run 4:  min=134ms  max=535ms  avg=282ms
+Run 5:  min=117ms  max=550ms  avg=351ms
+Run 6:  min=134ms  max=567ms  avg=283ms
+Run 7:  min=131ms  max=564ms  avg=349ms
+Run 8:  min=168ms  max=578ms  avg=363ms
+Run 9:  min=153ms  max=550ms  avg=298ms
+Run 10: min=144ms  max=533ms  avg=350ms
+
+────────────────────────────────────────
+Total requests: 200
+Latency min:    117ms
+Latency max:    578ms
+Latency avg:    324ms
+Expected range: 50–500ms per request
+```
 
 > Spans are created on every request but exported nowhere yet — no OTel
 > Collector is running. They will appear in Jaeger once Phase 6 is complete.
