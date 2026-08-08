@@ -344,20 +344,38 @@ POST /pay
              └── return 200 JSON
 ```
 
-**Verified — 10 + 20 requests (30 total), 2 declined (~10%):**
+**Verified — 1000 requests (10 runs × 100), 87 declined (8.7%):**
 ```bash
 # terminal 1
 go run ./services/payments/main.go
 
-# terminal 2 — first run (10 requests, all approved)
-bash scripts/test_payments.sh   # ran 10, got 0 failures (within normal variance)
+# terminal 2
+bash scripts/stress_payments.sh
 
-# second run (20 requests, 2 declined)
-bash scripts/test_payments.sh   # ran 20, got 2 failures
+Run 1:  approved=87  declined=13  failure_rate=13%
+Run 2:  approved=88  declined=12  failure_rate=12%
+Run 3:  approved=92  declined=8   failure_rate=8%
+Run 4:  approved=96  declined=4   failure_rate=4%
+Run 5:  approved=90  declined=10  failure_rate=10%
+Run 6:  approved=93  declined=7   failure_rate=7%
+Run 7:  approved=89  declined=11  failure_rate=11%
+Run 8:  approved=94  declined=6   failure_rate=6%
+Run 9:  approved=89  declined=11  failure_rate=11%
+Run 10: approved=95  declined=5   failure_rate=5%
 
-Request 4:  declined   ← ERROR span + "payment failed" event recorded
-Request 18: declined   ← ERROR span + "payment failed" event recorded
+────────────────────────────────────────
+Total requests: 1000
+Total approved: 913  (91%)
+Total declined:  87  (8.7%)
+Expected failure rate: ~10%
 ```
+
+Per-run variance swings 4%–13% — expected at 100 requests per run.
+Across 1000 total it converges to 8.7%, confirming `rand.Intn(10) == 0` is correct.
+
+**Test scripts:**
+- `bash scripts/test_payments.sh` — 100 requests, prints each result + summary
+- `bash scripts/stress_payments.sh` — 10 × 100 requests, shows per-run rate + aggregate
 
 > Spans are created on every request but exported nowhere yet — no OTel
 > Collector is running. They will appear in Jaeger once Phase 6 is complete.
