@@ -6,6 +6,67 @@ Four Go microservices. OpenTelemetry instrumentation. Jaeger for storage and vis
 
 ---
 
+## Why Go (Not Python)
+
+This project uses patterns that Go handles well and Python struggles with structurally.
+
+**Goroutines vs threads**
+
+The fan-out in the order service fires inventory and payment calls in parallel:
+
+```go
+// Go — goroutines are cheap (2KB stack, multiplexed on OS threads)
+wg.Add(2)
+go func(ctx context.Context) { callInventory(ctx, itemID) }(ctx)
+go func(ctx context.Context) { callPayment(ctx, amount) }(ctx)
+wg.Wait()
+```
+
+Python has the GIL — only one thread runs Python bytecode at a time. For I/O-bound work you'd use `asyncio`, but that requires async/await through the entire call stack. In Go, goroutines work without rewiring your code.
+
+**Context as a first-class citizen**
+
+Go's `context.Context` is how cancellation, deadlines, and trace propagation flow through the call graph. Every function in this project passes `ctx` explicitly:
+
+```go
+func callInventory(ctx context.Context, itemID string) (stockResponse, error) {
+    ctx, span := tracer.Start(ctx, "orders.call_inventory")
+    ...
+}
+```
+
+Python has `contextvars` but it's not idiomatic — most libraries don't thread it through. OTel's Python SDK uses thread-local storage as a workaround, which breaks under async code.
+
+**Compile-time correctness**
+
+The context extraction bug (`r.Context()` vs `Extract(r.Context(), ...)`) produced no runtime error and no log output — the code ran fine, traces just didn't link. In Go, type errors and missing returns are caught at compile time. Silent logic bugs still happen, but an entire class of errors doesn't make it to production.
+
+**Single binary, tiny Docker image**
+
+```dockerfile
+FROM golang:1.26-alpine AS builder
+RUN go build -o /gateway ./services/gateway/main.go  # compiles to one binary
+
+FROM alpine:3.20                                      # no runtime needed
+COPY --from=builder /gateway /gateway                 # copy binary only
+```
+
+Python requires the interpreter, all dependencies, and often a larger base image. A Go service image is typically 10–20MB. A Python equivalent is 200–400MB.
+
+**Explicit error handling**
+
+```go
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+    span.SetStatus(codes.Error, err.Error())
+    return stockResponse{}, err
+}
+```
+
+Every error is a value you handle or propagate. There's no exception that silently unwinds the stack. In distributed systems, knowing exactly where an error originated matters — Go forces you to be explicit about it.
+
+---
+
 ## Tech Versions (pinned)
 
 | Tool | Version | Notes |
