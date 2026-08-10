@@ -1,8 +1,8 @@
-# compiled binaries
-payments
-inventory
-orders
-gateway
+# compiled binaries (root level only)
+/payments
+/inventory
+/orders
+/gateway
 
 # Go build cache
 *.test

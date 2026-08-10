@@ -10,6 +10,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var tracer = otel.Tracer("payments")
@@ -26,7 +27,7 @@ type payResponse struct {
 
 func handlePay(w http.ResponseWriter, r *http.Request) {
 	// Extract traceparent from incoming request and create a child span.
-	ctx := r.Context()
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
 	ctx, span := tracer.Start(ctx, "payments.charge")
 	defer span.End()
 
